@@ -21,3 +21,8 @@ zoteroshortdoi-tag-invalid = Invalid DOI
 zoteroshortdoi-tag-multiple = Multiple possible DOIs found
 
 zoteroshortdoi-tag-nodoi = No DOI found
+
+zoteroshortdoi-doi-fallback = DOI Lookup Options
+
+zoteroshortdoi-doi-fallback-desc = 
+    .label = When CrossRef does not find a DOI, try looking in arXiv

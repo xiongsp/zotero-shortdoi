@@ -37,6 +37,75 @@ ShortDOI = {
         return Zotero.Prefs.set("extensions.shortdoi." + pref, value, true);
     },
 
+    // Helper function to compare strings (case-insensitive, normalized)
+    stringsSimilar(str1, str2) {
+        if (!str1 || !str2) return false;
+        const normalize = s => s.toLowerCase().trim().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ');
+        const normalized1 = normalize(str1);
+        const normalized2 = normalize(str2);
+        
+        // Exact match after normalization
+        if (normalized1 === normalized2) return true;
+        
+        // Also check if one contains the other (for partial matches)
+        if (normalized1.includes(normalized2) || normalized2.includes(normalized1)) {
+            return true;
+        }
+        
+        return false;
+    },
+
+    // Helper function to check if authors match
+    authorsMatch(itemCreators, arxivAuthors) {
+        if (!itemCreators || itemCreators.length === 0 || !arxivAuthors || arxivAuthors.length === 0) {
+            return false;
+        }
+        
+        // Normalize author name for comparison
+        const normalizeAuthor = (name) => {
+            return name.toLowerCase().trim().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ');
+        };
+        
+        // Check if at least one author matches
+        for (let creator of itemCreators) {
+            const fullName = `${creator.firstName || ''} ${creator.lastName || ''}`.trim();
+            const normalizedFullName = normalizeAuthor(fullName);
+            const normalizedLastName = normalizeAuthor(creator.lastName || '');
+            
+            for (let arxivAuthor of arxivAuthors) {
+                const normalizedArxivAuthor = normalizeAuthor(arxivAuthor);
+                const arxivLastName = normalizeAuthor(arxivAuthor.split(' ').pop() || '');
+                
+                // Check full name match or last name match
+                if (normalizedFullName === normalizedArxivAuthor || 
+                    normalizedLastName === arxivLastName ||
+                    normalizedFullName.includes(normalizedArxivAuthor) ||
+                    normalizedArxivAuthor.includes(normalizedFullName)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    },
+
+    // Show confirmation dialog to user
+    async confirmArxivMatch(item, arxivData) {
+        const ps = Components.classes["@mozilla.org/embedcomp/prompt-service;1"]
+            .getService(Components.interfaces.nsIPromptService);
+        
+        const itemTitle = item.getField('title') || 'Unknown';
+        const itemAuthors = item.getCreators().map(c => `${c.firstName || ''} ${c.lastName || ''}`.trim()).join(', ');
+        
+        const message = `在 arXiv 中找到可能的匹配项:\n\n` +
+            `当前条目:\n标题: ${itemTitle}\n作者: ${itemAuthors}\n\n` +
+            `arXiv 条目:\n标题: ${arxivData.title}\n作者: ${arxivData.authors.join(', ')}\n` +
+            `DOI: ${arxivData.doi}\n\n` +
+            `是否使用此 DOI?`;
+        
+        const result = ps.confirm(null, "确认 arXiv DOI", message);
+        return result;
+    },
+
     // Startup - initialize plugin
 
     init({ id, version, rootURI } = {}) {
@@ -818,14 +887,21 @@ ShortDOI.crossrefLookup = function (item, operation) {
                             ShortDOI.updateNextItem(operation);
                         }
                     } else if (status === "unresolved") {
-                        error_nodoi = true;
-                        item.removeTag(ShortDOI.getPref("tag_invalid"));
-                        item.removeTag(ShortDOI.getPref("tag_multiple"));
-                        item.removeTag(ShortDOI.getPref("tag_nodoi"));
-                        if (ShortDOI.getPref("tag_nodoi") !== "")
-                            item.addTag(ShortDOI.getPref("tag_nodoi"), 1);
-                        item.saveTx();
-                        ShortDOI.updateNextItem(operation);
+                        // Try arXiv if enabled
+                        Zotero.log("Zotero DOI Manager: CrossRef lookup: DOI not found.");
+                        if (ShortDOI.getPref("arxiv_fallback")) {
+                            Zotero.log("Zotero DOI Manager: Trying arXiv lookup as fallback.");
+                            ShortDOI.arxivLookup(item, operation);
+                        } else {
+                            error_nodoi = true;
+                            item.removeTag(ShortDOI.getPref("tag_invalid"));
+                            item.removeTag(ShortDOI.getPref("tag_multiple"));
+                            item.removeTag(ShortDOI.getPref("tag_nodoi"));
+                            if (ShortDOI.getPref("tag_nodoi") !== "")
+                                item.addTag(ShortDOI.getPref("tag_nodoi"), 1);
+                            item.saveTx();
+                            ShortDOI.updateNextItem(operation);
+                        }
                     } else if (status === "multiresolved") {
                         error_multiple = true;
                         Zotero.Attachments.linkFromURL({
@@ -863,4 +939,149 @@ ShortDOI.crossrefLookup = function (item, operation) {
     }
 
     return false;
+};
+ShortDOI.arxivLookup = function (item, operation) {
+    const title = item.getField('title');
+    if (!title) {
+        Zotero.log("Zotero DOI Manager: arXiv lookup: No title found.");
+        ShortDOI.handleNoDOI(item, operation);
+        return;
+    }
+
+    // Search arXiv API
+    const searchUrl = `http://export.arxiv.org/api/query?search_query=ti:${encodeURIComponent(title)}&max_results=10`;
+    
+    const req = new XMLHttpRequest();
+    req.open("GET", searchUrl, true);
+
+    req.onreadystatechange = async function () {
+        if (req.readyState == 4) {
+            if (req.status == 200) {
+                const parser = new DOMParser();
+                const xmlDoc = parser.parseFromString(req.responseText, "text/xml");
+                const entries = xmlDoc.getElementsByTagName("entry");
+                Zotero.log(`Zotero DOI Manager: arXiv lookup: Found ${entries.length} entries.`);
+
+                if (entries.length > 0) {
+                    // Get item's first author
+                    const itemCreators = item.getCreators();
+                    const firstAuthor = itemCreators.length > 0 ? itemCreators[0] : null;
+                    
+                    // Search through all entries to find a match
+                    let bestMatch = null;
+                    
+                    for (let i = 0; i < entries.length; i++) {
+                        const entry = entries[i];
+                        const arxivTitle = entry.getElementsByTagName("title")[0]?.textContent?.trim();
+                        
+                        // Get first author from arXiv entry
+                        const authorElements = entry.getElementsByTagName("author");
+                        const arxivFirstAuthor = authorElements.length > 0 
+                            ? authorElements[0].getElementsByTagName("name")[0]?.textContent?.trim()
+                            : null;
+                        
+                        // Check if title matches (case-insensitive)
+                        const titleMatch = ShortDOI.stringsSimilar(title, arxivTitle);
+                        
+                        // Check if first author matches (case-insensitive)
+                        let firstAuthorMatch = false;
+                        if (firstAuthor && arxivFirstAuthor) {
+                            const itemAuthorFull = `${firstAuthor.firstName || ''} ${firstAuthor.lastName || ''}`.trim();
+                            const normalizeAuthor = (name) => {
+                                return name.toLowerCase().trim().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ');
+                            };
+                            
+                            const normalizedItemAuthor = normalizeAuthor(itemAuthorFull);
+                            const normalizedItemLastName = normalizeAuthor(firstAuthor.lastName || '');
+                            const normalizedArxivAuthor = normalizeAuthor(arxivFirstAuthor);
+                            const arxivLastName = normalizeAuthor(arxivFirstAuthor.split(' ').pop() || '');
+                            
+                            // Match by full name or last name
+                            firstAuthorMatch = normalizedItemAuthor === normalizedArxivAuthor ||
+                                             normalizedItemLastName === arxivLastName ||
+                                             normalizedItemAuthor.includes(normalizedArxivAuthor) ||
+                                             normalizedArxivAuthor.includes(normalizedItemAuthor);
+                        }
+                        
+                        Zotero.log(`Zotero DOI Manager: arXiv entry ${i}: Title match: ${titleMatch}, Author match: ${firstAuthorMatch}`);
+                        
+                        // If both title and first author match, this is our best match
+                        if (titleMatch && firstAuthorMatch) {
+                            bestMatch = entry;
+                            Zotero.log(`Zotero DOI Manager: arXiv lookup: Found exact match at index ${i}`);
+                            break;
+                        }
+                    }
+                    
+                    if (bestMatch) {
+                        // Extract DOI from the matched entry
+                        const doiElement = Array.from(bestMatch.getElementsByTagName("link")).find(
+                            link => link.getAttribute("title") === "doi"
+                        );
+                        var doi = doiElement?.getAttribute("href")?.replace("http://dx.doi.org/", "");
+                        
+                        // If no DOI in entry, generate from arXiv ID
+                        if (!doi) {
+                            const pdfLinkElement = Array.from(bestMatch.getElementsByTagName("link")).find(
+                                link => link.getAttribute("title") === "pdf"
+                            );
+                            if (pdfLinkElement) {
+                                const pdfUrl = pdfLinkElement.getAttribute("href");
+                                const arxivIdMatch = pdfUrl.match(/arxiv.org\/pdf\/([^\s\/]+)(v\d+)?/i);
+                                if (arxivIdMatch) {
+                                    const arxivId = arxivIdMatch[1];
+                                    var generatedDoi = `10.48550/arXiv.${arxivId}`;
+                                    generatedDoi = generatedDoi.replace(/v\d+$/, "");
+                                    Zotero.log(`Zotero DOI Manager: arXiv lookup: Generated DOI from arXiv ID: ${generatedDoi}`);
+                                    doi = generatedDoi;
+                                }
+                            }
+                        }
+                        
+                        if (doi) {
+                            Zotero.log(`Zotero DOI Manager: arXiv lookup: Using DOI: ${doi}`);
+                            ShortDOI.applyArxivDOI(item, doi, operation);
+                        } else {
+                            Zotero.log("Zotero DOI Manager: arXiv lookup: No DOI found for matched entry.");
+                            ShortDOI.handleNoDOI(item, operation);
+                        }
+                    } else {
+                        Zotero.log("Zotero DOI Manager: arXiv lookup: No matching entry found.");
+                        ShortDOI.handleNoDOI(item, operation);
+                    }
+                } else {
+                    ShortDOI.handleNoDOI(item, operation);
+                }
+            } else {
+                ShortDOI.handleNoDOI(item, operation);
+            }
+        }
+    };
+
+    req.send(null);
+};
+ShortDOI.applyArxivDOI = function (item, doi, operation) {
+    if (operation === "short") {
+        item.setField("DOI", doi);
+        ShortDOI.updateItem(item, operation);
+    } else {
+        item.setField("DOI", doi);
+        item.removeTag(ShortDOI.getPref("tag_invalid"));
+        item.removeTag(ShortDOI.getPref("tag_multiple"));
+        item.removeTag(ShortDOI.getPref("tag_nodoi"));
+        item.saveTx();
+        ShortDOI.counter++;
+        ShortDOI.updateNextItem(operation);
+    }
+};
+
+ShortDOI.handleNoDOI = function (item, operation) {
+    error_nodoi = true;
+    item.removeTag(ShortDOI.getPref("tag_invalid"));
+    item.removeTag(ShortDOI.getPref("tag_multiple"));
+    item.removeTag(ShortDOI.getPref("tag_nodoi"));
+    if (ShortDOI.getPref("tag_nodoi") !== "")
+        item.addTag(ShortDOI.getPref("tag_nodoi"), 1);
+    item.saveTx();
+    ShortDOI.updateNextItem(operation);
 };

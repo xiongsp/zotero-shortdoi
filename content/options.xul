@@ -12,6 +12,7 @@
   <prefpane label="&shortdoi-preferences;" id="shortdoi-prefpane">
     <preferences>
       <preference id="pref-shortdoi-autoretrieve" name="extensions.shortdoi.autoretrieve" type="string"/>
+      <preference id="pref-shortdoi-arxiv-fallback" name="extensions.shortdoi.arxiv_fallback" type="bool"/>
       <preference id="pref-shortdoi-tag-invalid" name="extensions.shortdoi.tag_invalid" type="string"/>
       <preference id="pref-shortdoi-tag-multiple" name="extensions.shortdoi.tag_multiple" type="string"/>
       <preference id="pref-shortdoi-tag-nodoi" name="extensions.shortdoi.tag_nodoi" type="string"/>
@@ -25,6 +26,14 @@
         <radio label="&autoretrieve-check-label;" value='check'/>
         <radio label="&autoretrieve-no-label;" value='none'/>
       </radiogroup>
+    </groupbox>
+    <separator class="thin"/>
+
+    <groupbox>
+      <caption label="&doi-fallback-label;"/>
+      <checkbox id="id-shortdoi-arxiv-fallback" 
+                preference="pref-shortdoi-arxiv-fallback"
+                label="&doi-fallback-desc;"/>
     </groupbox>
     <separator class="thin"/>
 
